@@ -27,20 +27,23 @@ func errCode(err error) string {
 		return "training_complete"
 	case errors.Is(err, ErrNoActiveMembers):
 		return "no_active_members"
+	case errors.Is(err, ErrShuttingDown):
+		return "shutting_down"
 	default:
 		return "internal_error"
 	}
 }
 
-// Serve 启动本地 unix-socket RPC 服务并阻塞，直到 ctx 取消或训练全部完成。
+// Serve 启动本地 unix-socket RPC 服务并阻塞，直到 ctx 取消、收到停止请求
+// 或训练全部完成；返回前必然完成收尾（最终检查点 + 释放监听/连接）。
 func (c *Coordinator) Serve(ctx context.Context) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	srv := transport.NewServer(c.cfg.SocketPath, c.handle)
 	c.server = srv
 	if err := srv.Start(ctx); err != nil {
 		return err
 	}
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
 	// 周期性心跳超时检测（服务进程内使用真实时间）。
 	watchDone := make(chan struct{})
 	go func() {
@@ -62,7 +65,7 @@ func (c *Coordinator) Serve(ctx context.Context) error {
 			}
 		}
 	}()
-	// 周期性检查训练是否完成，完成即优雅退出。
+	// 周期性检查训练是否完成或已被请求停机，任一成立即优雅退出。
 	donePoll := make(chan struct{})
 	go func() {
 		defer close(donePoll)
@@ -78,10 +81,22 @@ func (c *Coordinator) Serve(ctx context.Context) error {
 					cancel()
 					return
 				}
+				if c.Stopping() {
+					c.log(EvDecision, "stop requested; coordinator shutting down gracefully")
+					cancel()
+					return
+				}
 			}
 		}
 	}()
 	<-ctx.Done()
+	// 收尾：标记停机（拒绝尚在排队的新请求），在最新【完整提交】状态上落
+	// 最终检查点并生成退出报告；在途步骤的部分贡献绝不写入。
+	c.mu.Lock()
+	c.stopping = true
+	c.finalizeLocked()
+	c.mu.Unlock()
+	// 释放本地资源：监听 socket、连接与看门狗 goroutine 全部收干净再返回。
 	srv.Wait()
 	<-watchDone
 	<-donePoll
@@ -177,6 +192,15 @@ func (c *Coordinator) handle(ctx context.Context, req *transport.Envelope) *tran
 		}
 		b, _ := json.Marshal(resp)
 		return &transport.Envelope{Type: proto.MsgCheckpoint, Payload: b}
+
+	case proto.MsgStop:
+		var p proto.StopRequest
+		if err := json.Unmarshal(req.Payload, &p); err != nil {
+			return replyError(err)
+		}
+		resp := c.RequestStop(p.Requester)
+		b, _ := json.Marshal(resp)
+		return &transport.Envelope{Type: proto.MsgStop, Payload: b}
 
 	default:
 		return &transport.Envelope{Error: "unknown message type: " + req.Type, Code: "bad_request"}

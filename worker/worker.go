@@ -60,6 +60,10 @@ func New(cfg Config) *Worker {
 	return w
 }
 
+// ErrCoordinatorStopped 表示协调者正在优雅停机，暂时不再下发工作。
+// reconnect=true 时 Run 会退避等待协调者重启后继续；否则把该错误返回给调用方。
+var ErrCoordinatorStopped = errors.New("worker: coordinator is shutting down")
+
 // RPCError 携带协调者给出的稳定错误码。
 type RPCError struct {
 	Code string
@@ -148,6 +152,10 @@ func (w *Worker) joinThenRunSteps(ctx context.Context) (bool, error) {
 		}
 		if nr.Done {
 			return true, nil
+		}
+		if nr.Stopped {
+			w.logger.Printf("coordinator is shutting down; will wait for it to come back")
+			return false, ErrCoordinatorStopped
 		}
 		if nr.Assignment == nil {
 			if sleepCtx(ctx, w.cfg.PollInterval); ctx.Err() != nil {

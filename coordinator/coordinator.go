@@ -72,6 +72,17 @@ type Config struct {
 	HeartbeatTimeout time.Duration
 	StepTimeout      time.Duration
 	CheckpointEvery  int
+	// CheckpointKeep 检查点保留上限：每次落盘后只保留最新的这么多份，
+	// 但最新有效点永不删除（<=0 表示不自动清理）。
+	CheckpointKeep int
+	// ResumeFrom 显式指定从某个检查点文件恢复（回滚到较早的有效点）；
+	// 为空表示从目录里最新的检查点恢复。指定的文件缺失/半截/损坏/版本不符
+	// 都会以可区分错误明确拒绝，绝不静默全新启动。
+	ResumeFrom string
+	// ResumeFallback 为 true 时：最新检查点不可用（半截/损坏/版本不符）则
+	// 明确回退到仍然可用的更早检查点，并在事件日志中记录每一个被跳过的点
+	// 及其原因；一个都不可用则返回对应可区分错误。默认 false 保持严格拒绝。
+	ResumeFallback bool
 }
 
 // memberState 是一个 worker 的运行时状态。
@@ -121,6 +132,10 @@ type Coordinator struct {
 	members map[string]*memberState
 	txn     *stepTxn
 	done    bool
+	// stopping 已进入优雅停机流程：不再接收新工作。
+	stopping bool
+	// exit 退出报告（收尾完成后非空）。
+	exit *ExitReport
 
 	store  *checkpoint.Store
 	server *transport.Server
@@ -143,12 +158,39 @@ func New(cfg Config) (*Coordinator, error) {
 	c.params = make([]float64, cfg.NIn+1)
 	c.vel = make([]float64, cfg.NIn+1)
 
-	st, err := c.store.Load()
-	if err != nil {
-		if errors.Is(err, checkpoint.ErrMissing) {
-			return c, nil // 全新启动
+	var st *checkpoint.State
+	switch {
+	case cfg.ResumeFrom != "":
+		// 显式回滚到指定检查点：严格加载，任何不可用原因都明确拒绝。
+		s, err := c.store.LoadPath(cfg.ResumeFrom)
+		if err != nil {
+			return nil, fmt.Errorf("coordinator: resume-from %s: %w", cfg.ResumeFrom, err)
 		}
-		return nil, err // 半截/坏魔数/版本不符/损坏：明确拒绝
+		st = s
+		c.log(EvCheckpoint, fmt.Sprintf("explicit rollback: resume-from=%s", cfg.ResumeFrom))
+	case cfg.ResumeFallback:
+		// 最新点不可用时明确回退到仍然可用的更早点（跳过原因全部记录）。
+		s, path, skipped, err := c.store.LoadUsable()
+		if err != nil {
+			if errors.Is(err, checkpoint.ErrMissing) {
+				return c, nil // 全新启动
+			}
+			return nil, err
+		}
+		for _, sk := range skipped {
+			c.log(EvFailure, fmt.Sprintf("resume fallback: skipping unusable checkpoint: %v", sk))
+		}
+		st = s
+		c.log(EvCheckpoint, fmt.Sprintf("resume fallback: adopting usable checkpoint %s", path))
+	default:
+		s, err := c.store.Load()
+		if err != nil {
+			if errors.Is(err, checkpoint.ErrMissing) {
+				return c, nil // 全新启动
+			}
+			return nil, err // 半截/坏魔数/版本不符/损坏：明确拒绝
+		}
+		st = s
 	}
 	if err := c.restoreLocked(st); err != nil {
 		return nil, err

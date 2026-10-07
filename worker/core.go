@@ -142,6 +142,9 @@ func (c *Core) RunUntilDone(ctx context.Context) error {
 		if nr.Done {
 			return nil
 		}
+		if nr.Stopped {
+			return ErrCoordinatorStopped
+		}
 		if nr.Assignment == nil {
 			if c.PollInterval != nil {
 				if err := c.PollInterval(ctx); err != nil {

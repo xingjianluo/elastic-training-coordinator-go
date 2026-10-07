@@ -19,6 +19,18 @@ func (c *Coordinator) saveCheckpointLocked(reason string) (string, error) {
 	c.log(EvCheckpoint, fmt.Sprintf(
 		"checkpoint saved (%s): era=%d step=%d members=%v params=%d path=%s (atomic tmp+rename)",
 		reason, st.Era, st.Step, c.activeIDsLocked(), len(st.Params), path))
+	// 保留上限：只留最新 N 份；最新有效点（下次恢复要用的）绝不被清理，
+	// 因此清理后重启绝不会看起来像全新作业。
+	if c.cfg.CheckpointKeep > 0 {
+		removed, perr := c.store.Prune(c.cfg.CheckpointKeep)
+		if perr != nil {
+			c.log(EvFailure, fmt.Sprintf("checkpoint prune failed (keep=%d): %v", c.cfg.CheckpointKeep, perr))
+		} else if len(removed) > 0 {
+			c.log(EvCheckpoint, fmt.Sprintf(
+				"retention keep=%d: pruned %d old checkpoint(s) %v; latest %s kept for recovery",
+				c.cfg.CheckpointKeep, len(removed), removed, path))
+		}
+	}
 	return path, nil
 }
 

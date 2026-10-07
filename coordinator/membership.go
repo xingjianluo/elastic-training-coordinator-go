@@ -58,6 +58,10 @@ func (c *Coordinator) Join(req proto.JoinRequest) proto.JoinResponse {
 			req.WorkerID, c.era, c.step, c.activeIDsLocked()))
 		return proto.JoinResponse{OK: true, Membership: c.membershipLocked()}
 	}
+	if c.stopping {
+		c.log(EvDecision, fmt.Sprintf("join from new worker %q rejected: coordinator is shutting down", req.WorkerID))
+		return proto.JoinResponse{OK: false, Membership: c.membershipLocked()}
+	}
 
 	c.members[req.WorkerID] = &memberState{ID: req.WorkerID, JoinEra: c.era + 1, LastSeen: now}
 	c.advanceEraLocked(fmt.Sprintf("worker %q joined", req.WorkerID))

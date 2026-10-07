@@ -19,7 +19,7 @@
 | `proto` | worker↔coordinator 的 JSON 消息定义 |
 | `transport` | unix domain socket 上的换行分隔 JSON RPC，客户端断线自动重连 |
 | `checkpoint` | magic+版本+长度+JSON+SHA256，临时文件 + `rename` 原子提交 |
-| `coordinator` | 成员/era 管理、步骤台账、幂等去重、慢/死判定、检查点、RPC 服务 |
+| `coordinator` | 成员/era 管理、步骤台账、幂等去重、慢/死判定、检查点、优雅停机、RPC 服务 |
 | `worker` | 与传输无关的计算核心 `Core` + 走 socket 的客户端 `Worker` |
 | `cmd/etcd` | 协调者进程（elastic-training-coordinator-daemon） |
 | `cmd/etcworker` | worker 进程 |
@@ -112,7 +112,51 @@
 - 恢复后从检查点的 `step` 继续（已完成的步不重算），worker 用相同 ID 重新 join，
   最终结果与不中断一次性训练**位级一致**（有测试断言对齐单机基准）。
 
-## 4. 本地怎么验证
+### 保留上限（`-ckpt-keep`，默认 5）
+
+- 每次落盘后自动清理，只保留**最新 N 份**正式检查点（`coordinator.Config.CheckpointKeep`，
+  `<=0` 表示不自动清理）。
+- 不变量：**最新有效点永不被清理**（`keep` 会被钳制到 `>=1`），因此清理后重启
+  一定能从最新点恢复，绝不会因为清理让下次启动看起来像全新作业。
+- 只清理正式文件；遗留的 `.tmp` 半截文件保留，恢复时仍按上表规则判定。
+
+### 回滚与回退
+
+- **显式回滚**（`-resume-from <path>` / `Config.ResumeFrom`）：从指定的某个更早的
+  有效检查点重新往下跑。指定文件**已被清理/缺失 → `ErrMissing`，半截 →
+  `ErrPartialWrite`，损坏 → `ErrCorrupt`，版本不符 → `ErrVersionMismatch`**，
+  全部明确拒绝，绝不静默从头开始。回滚后继续训练的结果同样对齐单机基准（有测试）。
+- **明确回退**（`-resume-fallback` / `Config.ResumeFallback`，默认关闭）：最新检查点
+  不可用时，从最新到最旧依次尝试，**明确采用第一个仍然可用的点**，并在事件日志里
+  逐条记录被跳过的检查点及原因；一个都不可用则返回最相关的可区分错误。
+  默认（严格模式）仍是直接拒绝最新的坏点。
+- **兼容范围**：当前格式版本为 `checkpoint.FormatVersion = 1`；魔数 `ETCKPT01` 且
+  版本为 1 的历史检查点都可以恢复/回滚，版本不符的一律拒绝（或按回退规则跳过）。
+
+## 4. 优雅停机与续训
+
+协调者是一个可长期挂在本地、随时能停、停了能接着跑的作业：
+
+- **两条退出路径，殊途同归**：
+  - 跑满 `-steps` 目标步数（`ExitCompleted`）；
+  - 被外部叫停（`SIGINT`/`SIGTERM`，或任何客户端发 `stop` RPC /
+    `Coordinator.RequestStop`）（`ExitStopped`）。
+- **停机语义**：进入停机流程后立即**不再接收新工作**——新 worker 拒绝 join，
+  `next` 返回 `stopped`，在途的 `submit`/`allgather` 以稳定错误码
+  `shutting_down` 拒绝。随后在**最后一个完整提交的步**上落一份最终检查点，
+  关闭监听、断开连接、回收看门狗 goroutine，在有限时间内自行退出。
+- **绝无半提交**：检查点只包含已完整提交的步；停机哪怕发生在某一步集合通信
+  正做到一半，那一步的在途台账被整体丢弃，已收到的部分贡献**绝不写入**检查点，
+  重启后该步从头重做（不丢步、不重复累加）。
+- **如实报告**：进程退出前打印 `exit report: reason=completed|stopped step=N/M
+  checkpoint=<path>`，明确这次是跑满了还是被中途停下；`Coordinator.ExitReport()`
+  以结构化形式提供同一份信息。
+- **立即重启续训**：退出会释放 socket 文件等本地资源，用**同一套参数、同一条
+  socket 路径**即可马上重新拉起；worker 端默认自动重连（收到 `shutting_down` 或
+  连接中断后退避重试），协调者重启后接着检查点的步继续跑。
+  反复多轮“跑一段、停、重启”最终参数/优化器状态仍与不间断单机基准位级一致（有测试）。
+
+## 5. 本地怎么验证
 
 需要 Go 1.25+。不需要联网、不需要任何外部服务。
 
@@ -150,7 +194,29 @@ rm -rf /tmp/etc-demo && mkdir -p /tmp/etc-demo
 # 想忽略旧检查点全新启动：加 -no-resume
 ```
 
-## 5. 测试覆盖一览
+优雅停机与续训演示：
+
+```bash
+# 终端 1 的协调者跑到一半时，给它发 SIGTERM（或 Ctrl-C）：
+kill -TERM <etcd-pid>
+# 日志会打印：stop requested -> 在最后一个完整提交的步上落最终检查点 ->
+# exit report: reason=stopped step=N/6 checkpoint=...，随后在有限时间内自行退出。
+
+# 用同一套参数、同一条 socket 路径立刻重新拉起，从停机点继续：
+/tmp/etcd -socket /tmp/etc-demo/e.sock -ckpt-dir /tmp/etc-demo/ckpt -steps 6 ...
+# 跑满后日志打印 exit report: reason=completed step=6/6 ...
+
+# 检查点保留上限（默认 5）：目录里只留最新 5 份，最新有效点永不删除
+/tmp/etcd ... -ckpt-keep 3
+
+# 回滚到某个更早的有效检查点重新往下跑（文件缺失/损坏会被明确拒绝）：
+/tmp/etcd ... -resume-from /tmp/etc-demo/ckpt/ckpt-s0000002-e0000003.etc
+
+# 最新检查点损坏时，明确回退到仍然可用的更早点（日志记录每个被跳过的点）：
+/tmp/etcd ... -resume-fallback
+```
+
+## 6. 测试覆盖一览
 
 - `shard_test.go`：非法分片数、连续非空覆盖、切分/区间校验、多 worker 方案对不齐。
 - `collective_test.go`：1/2/3/5 片的 allreduce 与 canonical 求和、打乱到达顺序、
@@ -158,6 +224,9 @@ rm -rf /tmp/etc-demo && mkdir -p /tmp/etc-demo
 - `nn_test.go`：数据集与基准的确定性、梯度维度。
 - `checkpoint_test.go`：往返、选最新、缺失、半截 `.tmp`、截断正式文件、坏魔数、
   版本不符、校验和损坏、有效检查点优先于遗留 `.tmp`。
+- `checkpoint/retention_test.go`：保留上限只留最新 N 份、最新有效点永不删除、
+  被清理的点显式加载报 `ErrMissing`、`LoadUsable` 明确回退/全坏时报最新原因/
+  空目录与只有 `.tmp` 的区分。
 - `coordinator/elastic_test.go`：
   - 1/2/3 片且每步打乱 worker 顺序，结果对齐单机基准；
   - 训练中途加人/减人后分片重分配继续跑，对齐基准；
@@ -166,8 +235,18 @@ rm -rf /tmp/etc-demo && mkdir -p /tmp/etc-demo
   - 慢节点（心跳新鲜）与死节点（心跳超时）被明确区分，慢节点不被摘除。
 - `coordinator/recovery_test.go`：跑到一半用检查点重启接着跑并对齐基准；半截/坏魔数/
   版本不符/校验和损坏/维度不符在重启时分别被拒绝。
+- `coordinator/lifecycle_test.go`：
+  - 集合通信中途（reduce-scatter 只到 1/2）停机：在途步不半提交，最终检查点停在
+    最后完整提交的步，重启续训对齐基准；
+  - 退出报告如实区分 completed/stopped 且幂等；
+  - 停机后 join/next/submit 全部被拒（`shutting_down`）；
+  - 保留上限生效且重启不像全新作业；显式回滚到更早点继续跑对齐基准；
+  - 显式回滚点缺失/损坏被可区分拒绝；`-resume-fallback` 明确回退到可用点并对齐基准。
+- `coordinator/serve_lifecycle_test.go`：真实 `Serve`（unix socket）+ 真实 worker
+  连续多轮“跑一段、停、用同一 socket 路径重启”，每轮断言协调者在有限时间内自然
+  退出、socket 资源释放、退出报告正确，最终对齐单机基准且检查点数量不超过保留上限。
 - `coordinator/e2e_socket_test.go`：真实 unix socket + 多 goroutine worker 的端到端，
-  覆盖 IPC、心跳、并发与自动重连。
+  覆盖 IPC、心跳、并发与自动重连，完成后协调者干净退出并报告 completed。
 
 所有测试默认走确定性路径（固定种子、可控假时钟），并用 `t.Logf` 打印成员列表、
 分片区间与每一步的判定依据（`go test -v` 可见）。

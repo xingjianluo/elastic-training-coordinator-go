@@ -15,6 +15,7 @@ const (
 	MsgSubmit     = "submit"
 	MsgAllgather  = "allgather"
 	MsgCheckpoint = "checkpoint"
+	MsgStop       = "stop"
 )
 
 // Marshal / Unmarshal 把强类型负载编进 transport.Envelope 的原始 JSON。
@@ -132,7 +133,9 @@ type NextRequest struct {
 
 type NextResponse struct {
 	// Done 表示全部训练步骤已完成。
-	Done       bool            `json:"done"`
+	Done bool `json:"done"`
+	// Stopped 表示协调者正在优雅停机，不再下发新工作。
+	Stopped    bool            `json:"stopped,omitempty"`
 	Assignment *StepAssignment `json:"assignment,omitempty"`
 }
 
@@ -146,4 +149,16 @@ type CheckpointResponse struct {
 	Step int    `json:"step"`
 	Path string `json:"path"`
 	OK   bool   `json:"ok"`
+}
+
+// StopRequest 请求协调者优雅停机（幂等）。
+type StopRequest struct {
+	Requester string `json:"requester"`
+}
+
+// StopResponse 确认已进入停机流程；Step 为当时已完整提交的步数。
+type StopResponse struct {
+	OK   bool   `json:"ok"`
+	Era  uint64 `json:"era"`
+	Step int    `json:"step"`
 }

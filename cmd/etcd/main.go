@@ -25,6 +25,9 @@ func main() {
 	hbTimeout := flag.Duration("heartbeat-timeout", 2*time.Second, "心跳超时（判定死亡）")
 	stepTimeout := flag.Duration("step-timeout", 5*time.Second, "单步等待超时（区分掉队/死亡）")
 	ckptEvery := flag.Int("ckpt-every", 2, "每多少步落一次检查点（0=关闭）")
+	ckptKeep := flag.Int("ckpt-keep", 5, "检查点保留上限（<=0 不自动清理；最新有效点永不删除）")
+	resumeFrom := flag.String("resume-from", "", "显式从指定检查点文件恢复（回滚到较早的有效点）")
+	resumeFallback := flag.Bool("resume-fallback", false, "最新检查点不可用时明确回退到仍可用的更早点")
 	noResume := flag.Bool("no-resume", false, "忽略已有检查点全新启动")
 	flag.Parse()
 
@@ -41,6 +44,9 @@ func main() {
 		HeartbeatTimeout: *hbTimeout,
 		StepTimeout:      *stepTimeout,
 		CheckpointEvery:  *ckptEvery,
+		CheckpointKeep:   *ckptKeep,
+		ResumeFrom:       *resumeFrom,
+		ResumeFallback:   *resumeFallback,
 	}
 	var (
 		coord *coordinator.Coordinator
@@ -55,10 +61,13 @@ func main() {
 		log.Fatalf("coordinator init failed: %v", err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	go func() {
 		sigCh := make(chan os.Signal, 1)
 		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-		<-sigCh
+		sig := <-sigCh
+		log.Printf("received %v: requesting graceful stop (final checkpoint on last committed step, then exit)", sig)
+		coord.RequestStop("signal " + sig.String())
 		cancel()
 	}()
 	// 把协调者的判定依据（成员列表/分片区间/每步决策/失败原因）打到日志。
@@ -67,9 +76,14 @@ func main() {
 			log.Printf("[%s] %s", ev.Kind, ev.Detail)
 		}
 	}()
-	log.Printf("coordinator serving on %s (steps=%d; workers join dynamically)", *socket, steps)
+	log.Printf("coordinator serving on %s (steps=%d; workers join dynamically)", *socket, *steps)
 	if err := coord.Serve(ctx); err != nil {
 		log.Fatalf("serve failed: %v", err)
 	}
-	log.Printf("coordinator exited cleanly")
+	// 如实说明本次是跑满目标步数还是被中途停下。
+	if rep, ok := coord.ExitReport(); ok {
+		log.Printf("coordinator exited cleanly: %s", rep)
+	} else {
+		log.Printf("coordinator exited cleanly")
+	}
 }

@@ -27,11 +27,8 @@ func TestEndToEndOverUnixSocket(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go func() {
-		if err := coord.Serve(ctx); err != nil {
-			t.Logf("serve: %v", err)
-		}
-	}()
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- coord.Serve(ctx) }()
 	// 等 socket 就绪
 	if !waitFor(func() bool { return waitSock(sock) }, 2*time.Second) {
 		t.Fatal("socket never came up")
@@ -61,6 +58,18 @@ func TestEndToEndOverUnixSocket(t *testing.T) {
 	}
 	if !coord.Done() {
 		t.Fatal("training not done")
+	}
+	// 协调者必须在训练完成后于有限时间内干净退出（最终检查点落盘后再返回）。
+	select {
+	case err := <-serveDone:
+		if err != nil {
+			t.Fatalf("serve: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("coordinator did not exit cleanly after completion")
+	}
+	if rep, ok := coord.ExitReport(); !ok || rep.Reason != ExitCompleted || rep.Step != 6 {
+		t.Fatalf("exit report=%+v ok=%v, want completed 6/6", rep, ok)
 	}
 	assertCloseToBaseline(t, coord, 1e-9)
 }

@@ -98,6 +98,10 @@ func (c *Coordinator) Next(req proto.NextRequest) proto.NextResponse {
 	}
 	m.LastSeen = c.clock.Now()
 
+	if c.stopping {
+		c.log(EvDecision, fmt.Sprintf("worker %q asked next: coordinator is shutting down (no new work)", req.WorkerID))
+		return proto.NextResponse{Stopped: true}
+	}
 	if c.done {
 		c.log(EvDecision, fmt.Sprintf("worker %q asked next: training complete (no further work)", req.WorkerID))
 		return proto.NextResponse{Done: true}
@@ -147,6 +151,10 @@ func (c *Coordinator) checkContrib(workerID string, era uint64, step int) (*step
 		return nil, 0, ErrUnknownWorker
 	}
 	m.LastSeen = c.clock.Now()
+	if c.stopping {
+		// 停机流程中拒绝一切新贡献：在途步骤被丢弃，已提交部分绝不落盘。
+		return nil, 0, ErrShuttingDown
+	}
 	if c.done {
 		return nil, 0, ErrTrainingComplete
 	}

@@ -79,6 +79,13 @@ func (s *Server) acceptLoop(ctx context.Context) {
 			return
 		}
 		s.mu.Lock()
+		if s.closed {
+			// 停机与 accept 赛跑：closed 之后不再接纳新连接，
+			// 否则这条连接的处理 goroutine 会让 wg.Wait 永远等下去。
+			s.mu.Unlock()
+			_ = c.Close()
+			return
+		}
 		s.conns[c] = struct{}{}
 		s.mu.Unlock()
 		s.wg.Add(1)
