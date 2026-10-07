@@ -24,6 +24,8 @@ const (
 	KindVersionMismatch
 	KindCorrupt
 	KindMissing
+	KindNotFound
+	KindNoValid
 )
 
 var (
@@ -37,6 +39,10 @@ var (
 	ErrCorrupt = errors.New("checkpoint: content corrupt (checksum mismatch or unreadable body)")
 	// ErrMissing 目录下没有任何检查点。
 	ErrMissing = errors.New("checkpoint: no checkpoint found")
+	// ErrCheckpointNotFound 指定回滚点存在性检查失败：没有该 step 的正式检查点。
+	ErrCheckpointNotFound = errors.New("checkpoint: no checkpoint at requested step")
+	// ErrNoValidCheckpoint 目录里虽有文件，但没有一个能通过完整校验。
+	ErrNoValidCheckpoint = errors.New("checkpoint: no valid checkpoint available in directory")
 )
 
 // FormatVersion 是检查点格式版本。
@@ -324,6 +330,10 @@ func KindOf(err error) ErrorKind {
 		return KindCorrupt
 	case errors.Is(err, ErrMissing):
 		return KindMissing
+	case errors.Is(err, ErrCheckpointNotFound):
+		return KindNotFound
+	case errors.Is(err, ErrNoValidCheckpoint):
+		return KindNoValid
 	default:
 		return KindCorrupt
 	}

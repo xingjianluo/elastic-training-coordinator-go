@@ -26,7 +26,9 @@ type Config struct {
 	PollInterval time.Duration
 	// HeartbeatInterval 心跳间隔。
 	HeartbeatInterval time.Duration
-	Logger            Logger
+	// FinishDelay reduce 完成、allgather 之前的确定性停顿（停机演练用）。
+	FinishDelay time.Duration
+	Logger      Logger
 }
 
 // Worker 通过本地 IPC 与协调者协作的训练 worker。
@@ -56,6 +58,7 @@ func New(cfg Config) *Worker {
 		PollInterval: func(ctx context.Context) error {
 			return sleepCtx(ctx, cfg.PollInterval)
 		},
+		FinishDelay: cfg.FinishDelay,
 	}
 	return w
 }

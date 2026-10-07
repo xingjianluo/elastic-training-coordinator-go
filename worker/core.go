@@ -3,6 +3,7 @@ package worker
 import (
 	"context"
 	"encoding/json"
+	"time"
 
 	"github.com/xingjianluo/elastic-training-coordinator-go/nn"
 	"github.com/xingjianluo/elastic-training-coordinator-go/proto"
@@ -18,6 +19,9 @@ type Core struct {
 	ID           string
 	Call         CallFunc
 	PollInterval durationNapper
+	// FinishDelay>0 时，Finish 在 reduce 完成后、发起 allgather 前确定性停顿。
+	// 仅用于把“集合通信做到一半”的时间窗放大，便于优雅停机演练；默认 0。
+	FinishDelay time.Duration
 }
 
 type durationNapper func(ctx context.Context) error
@@ -98,6 +102,15 @@ func (c *Core) DoStep(ctx context.Context, a *proto.StepAssignment) error {
 
 // Finish 拿到已就绪的 reduce-scatter 结果后，本地做 SGD+momentum 更新并 allgather。
 func (c *Core) Finish(ctx context.Context, a *proto.StepAssignment, sr proto.SubmitResponse) error {
+	if c.FinishDelay > 0 {
+		t := time.NewTimer(c.FinishDelay)
+		defer t.Stop()
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-t.C:
+		}
+	}
 	iv := a.ParamRange
 	paramChunk := append([]float64(nil), a.Params[iv.Start:iv.End]...)
 	velChunk := append([]float64(nil), sr.VelocityChunk...)

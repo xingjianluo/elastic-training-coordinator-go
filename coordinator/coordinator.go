@@ -30,6 +30,8 @@ var (
 	ErrNoActiveMembers = errors.New("coordinator: no active members")
 )
 
+var errShuttingDown = errors.New("coordinator: shutting down, no new work accepted")
+
 // Clock 抽象时间源，便于测试中确定性地推进超时判定。
 type Clock interface {
 	Now() time.Time
@@ -49,6 +51,7 @@ const (
 	EvContribution EventKind = "contribution"
 	EvCheckpoint   EventKind = "checkpoint"
 	EvFailure      EventKind = "failure"
+	EvLifecycle    EventKind = "lifecycle"
 )
 
 // Event 是一步判定依据的结构化日志。
@@ -72,6 +75,18 @@ type Config struct {
 	HeartbeatTimeout time.Duration
 	StepTimeout      time.Duration
 	CheckpointEvery  int
+	// MaxCheckpoints 目录中保留检查点数量的上限；<=0 表示不限制。
+	MaxCheckpoints int
+	// ResumeStep 非 nil 时从指定 step 的较早检查点显式回滚续训；nil（默认）取最新点。
+	ResumeStep *int
+	// AutoRecover 为 true 时：最新检查点损坏/半截会自动尝试更早的可用点并明确记录
+	// 跳过原因，而不是直接拒绝；false（默认）时严格拒绝，绝不静默从头开始。
+	AutoRecover bool
+	// ShutdownTimeout 优雅停机的最长时间（落最终检查点 + 停止接收新工作 + 释放资源）。
+	ShutdownTimeout time.Duration
+	// CompletionGrace 跑满目标步数后、关闭 socket 前的宽限，让落后的 worker
+	// 仍能重连并拿到 Done；<0 表示不等待。默认由 cmd 设置（200ms）。
+	CompletionGrace time.Duration
 }
 
 // memberState 是一个 worker 的运行时状态。
@@ -79,6 +94,8 @@ type memberState struct {
 	ID       string
 	JoinEra  uint64
 	LastSeen time.Time
+	// deliveredDone 训练完成后已通过 next 向该 worker 下发 Done（完成确认）。
+	deliveredDone bool
 }
 
 // stepTxn 是当前开放步骤的在途台账。
@@ -126,6 +143,22 @@ type Coordinator struct {
 	server *transport.Server
 	events chan Event
 	clock  Clock
+
+	// 生命周期字段（详见 lifecycle.go）。
+	completeCh     chan struct{}
+	terminalCh     chan struct{}
+	completionCh   chan struct{}
+	terminalOnce   sync.Once
+	completeOnce   sync.Once
+	completionOnce sync.Once
+	shutdownOnce   sync.Once
+	// completionMembers 完成瞬间在册、需要收到 Done 的 worker（nil 表示尚未完成）。
+	completionMembers map[string]struct{}
+	stopping          bool
+	exitReason        ExitReason
+	exitDetail        string
+	finalCkptPath     string
+	finalCkptStep     int
 }
 
 // New 创建协调者并从最新检查点恢复（若存在）。
@@ -133,40 +166,50 @@ type Coordinator struct {
 // 不会静默当成全新启动，也不会当成有效检查点继续。
 func New(cfg Config) (*Coordinator, error) {
 	c := &Coordinator{
-		cfg:     cfg,
-		ds:      nn.NewDataset(cfg.NSamples, cfg.NIn, cfg.Seed),
-		members: map[string]*memberState{},
-		store:   checkpoint.NewStore(cfg.CheckpointDir),
-		events:  make(chan Event, 1024),
-		clock:   realClock{},
+		cfg:          cfg,
+		ds:           nn.NewDataset(cfg.NSamples, cfg.NIn, cfg.Seed),
+		members:      map[string]*memberState{},
+		store:        checkpoint.NewStore(cfg.CheckpointDir),
+		events:       make(chan Event, 1024),
+		clock:        realClock{},
+		completeCh:   make(chan struct{}),
+		terminalCh:   make(chan struct{}),
+		completionCh: make(chan struct{}),
+		exitReason:   ExitRunning,
 	}
 	c.params = make([]float64, cfg.NIn+1)
 	c.vel = make([]float64, cfg.NIn+1)
 
-	st, err := c.store.Load()
+	st, path, skipped, err := c.loadForResume()
 	if err != nil {
 		if errors.Is(err, checkpoint.ErrMissing) {
 			return c, nil // 全新启动
 		}
 		return nil, err // 半截/坏魔数/版本不符/损坏：明确拒绝
 	}
+	if st == nil {
+		return c, nil // 全新启动（目录无检查点）
+	}
 	if err := c.restoreLocked(st); err != nil {
 		return nil, err
 	}
-	c.log(EvCheckpoint, fmt.Sprintf("restored from checkpoint: era=%d step=%d members=%v",
-		st.Era, st.Step, memberNames(st.Members)))
+	c.afterRestoreLocked(path, skipped, st)
 	return c, nil
 }
 
 // NewNoResume 创建协调者且忽略已有检查点（测试用）。
 func NewNoResume(cfg Config) (*Coordinator, error) {
 	c := &Coordinator{
-		cfg:     cfg,
-		ds:      nn.NewDataset(cfg.NSamples, cfg.NIn, cfg.Seed),
-		members: map[string]*memberState{},
-		store:   checkpoint.NewStore(cfg.CheckpointDir),
-		events:  make(chan Event, 1024),
-		clock:   realClock{},
+		cfg:          cfg,
+		ds:           nn.NewDataset(cfg.NSamples, cfg.NIn, cfg.Seed),
+		members:      map[string]*memberState{},
+		store:        checkpoint.NewStore(cfg.CheckpointDir),
+		events:       make(chan Event, 1024),
+		clock:        realClock{},
+		completeCh:   make(chan struct{}),
+		terminalCh:   make(chan struct{}),
+		completionCh: make(chan struct{}),
+		exitReason:   ExitRunning,
 	}
 	c.params = make([]float64, cfg.NIn+1)
 	c.vel = make([]float64, cfg.NIn+1)

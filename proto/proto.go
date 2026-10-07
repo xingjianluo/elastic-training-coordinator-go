@@ -15,6 +15,8 @@ const (
 	MsgSubmit     = "submit"
 	MsgAllgather  = "allgather"
 	MsgCheckpoint = "checkpoint"
+	// MsgStop 请求协调者优雅停机（落最终检查点后在有限时间内退出）。
+	MsgStop = "stop"
 )
 
 // Marshal / Unmarshal 把强类型负载编进 transport.Envelope 的原始 JSON。
@@ -146,4 +148,17 @@ type CheckpointResponse struct {
 	Step int    `json:"step"`
 	Path string `json:"path"`
 	OK   bool   `json:"ok"`
+}
+
+// StopRequest 请求协调者开始优雅停机流程。
+type StopRequest struct {
+	// Reason 调用方给出的停机原因（记录到日志/退出状态）。
+	Reason string `json:"reason"`
+}
+
+// StopResponse 是协调者接受停机请求后的回执（随后它会自行落检查点并退出）。
+type StopResponse struct {
+	OK   bool   `json:"ok"`
+	Step int    `json:"step"`
+	Era  uint64 `json:"era"`
 }

@@ -79,6 +79,13 @@ func (s *Server) acceptLoop(ctx context.Context) {
 			return
 		}
 		s.mu.Lock()
+		// 停机可能与 accept 竞争：服务已关闭时直接丢弃这个新连接，
+		// 不能把它加进 map 后让其读协程永远阻塞（会让 stop 的 wg.Wait 死等）。
+		if s.closed {
+			s.mu.Unlock()
+			_ = c.Close()
+			return
+		}
 		s.conns[c] = struct{}{}
 		s.mu.Unlock()
 		s.wg.Add(1)
@@ -143,12 +150,20 @@ func (s *Server) stop() {
 	}
 	s.closed = true
 	l := s.listener
+	// 只在锁内收集连接快照，绝不能持锁关闭连接：否则某个正在执行 handler、
+	// 返回后要拿这把锁把自己从 map 删除的 connLoop 会与这里自锁。
+	conns := make([]net.Conn, 0, len(s.conns))
 	for c := range s.conns {
-		_ = c.Close()
+		conns = append(conns, c)
 	}
 	s.mu.Unlock()
+	// 先关监听器：此后 acceptLoop 要么已返回、要么带着新连接看到 closed 并丢弃，
+	// 不会再把新连接放进 map。再在锁外关闭当前所有连接，保证读协程都能退出。
 	if l != nil {
 		_ = l.Close()
+	}
+	for _, c := range conns {
+		_ = c.Close()
 	}
 	_ = os.Remove(s.socketPath)
 	s.wg.Wait()
@@ -156,6 +171,10 @@ func (s *Server) stop() {
 
 // Addr 返回监听的 socket 路径。
 func (s *Server) Addr() string { return s.socketPath }
+
+// Stop 主动关闭监听器与全部连接并删除 socket 文件，阻塞直到处理 goroutine 退出。
+// 幂等：Start 绑定的 ctx 取消时也会调用，重复调用安全。
+func (s *Server) Stop() { s.stop() }
 
 // Wait 阻塞直到服务完全停止。
 func (s *Server) Wait() { s.wg.Wait() }

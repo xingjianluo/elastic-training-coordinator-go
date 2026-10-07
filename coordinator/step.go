@@ -99,8 +99,13 @@ func (c *Coordinator) Next(req proto.NextRequest) proto.NextResponse {
 	m.LastSeen = c.clock.Now()
 
 	if c.done {
+		c.noteDeliveredDoneLocked(req.WorkerID)
 		c.log(EvDecision, fmt.Sprintf("worker %q asked next: training complete (no further work)", req.WorkerID))
 		return proto.NextResponse{Done: true}
+	}
+	if c.stopping {
+		// 停机已开始：不再下发新工作，明确告知而不是让 worker 空转/误判。
+		return proto.NextResponse{}
 	}
 	t := c.openStepLocked()
 	if t == nil {
@@ -149,6 +154,9 @@ func (c *Coordinator) checkContrib(workerID string, era uint64, step int) (*step
 	m.LastSeen = c.clock.Now()
 	if c.done {
 		return nil, 0, ErrTrainingComplete
+	}
+	if c.stopping {
+		return nil, 0, ErrShuttingDown
 	}
 	if c.txn == nil || era != c.era || step != c.step {
 		// 成员变动推进 era 后，旧 era 的在途贡献一律拒绝（整步重来，不部分提交）。
@@ -315,9 +323,20 @@ func (c *Coordinator) Allgather(req proto.AllgatherRequest) (proto.AllgatherResp
 		if c.step >= c.cfg.Steps {
 			c.done = true
 			c.log(EvDecision, fmt.Sprintf("training reached %d steps => DONE", c.cfg.Steps))
-		}
-		if c.cfg.CheckpointEvery > 0 && c.step%c.cfg.CheckpointEvery == 0 {
+			// 跑满目标步数：先在最终状态落一个检查点（仍在持锁的原子提交临界区内），
+			// 再发完成信号；是否随后关闭 socket 由 Serve 决定（进程内测试可不落异步动作）。
+			path, perr := c.saveCheckpointLocked("final checkpoint on completing all target steps")
+			if perr != nil {
+				c.log(EvFailure, fmt.Sprintf("completion checkpoint save failed: %v", perr))
+			} else {
+				c.finalCkptPath = path
+				c.finalCkptStep = c.step
+			}
+			c.pruneAndSweepLocked("after completion")
+			c.signalCompletedLocked()
+		} else if c.cfg.CheckpointEvery > 0 && c.step%c.cfg.CheckpointEvery == 0 {
 			c.saveCheckpointLocked("periodic")
+			c.pruneAndSweepLocked("periodic")
 		}
 	}
 

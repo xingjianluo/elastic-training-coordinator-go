@@ -27,7 +27,9 @@ func TestEndToEndOverUnixSocket(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	serveDone := make(chan struct{})
 	go func() {
+		defer close(serveDone)
 		if err := coord.Serve(ctx); err != nil {
 			t.Logf("serve: %v", err)
 		}
@@ -47,7 +49,7 @@ func TestEndToEndOverUnixSocket(t *testing.T) {
 			HeartbeatInterval: 20 * time.Millisecond,
 			Logger:            testLogger{t: t, id: id},
 		})
-		go func() { errCh <- w.Run(ctx, true) }()
+		go func(w *worker.Worker) { errCh <- w.Run(ctx, true) }(w)
 	}
 	for i := 0; i < world; i++ {
 		select {
@@ -61,6 +63,19 @@ func TestEndToEndOverUnixSocket(t *testing.T) {
 	}
 	if !coord.Done() {
 		t.Fatal("training not done")
+	}
+	// 等协调者真正完成优雅停机（最终检查点写完、socket 释放）再断言，
+	// 避免后台落盘/清理检查点与测试的 TempDir 清理发生竞争。
+	select {
+	case <-coord.Terminal():
+	case <-time.After(5 * time.Second):
+		t.Fatal("coordinator did not terminate after completion")
+	}
+	// Serve 已在 Terminal 后关闭 socket；等待其 goroutine 完全返回。
+	select {
+	case <-serveDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Serve goroutine did not return after termination")
 	}
 	assertCloseToBaseline(t, coord, 1e-9)
 }
